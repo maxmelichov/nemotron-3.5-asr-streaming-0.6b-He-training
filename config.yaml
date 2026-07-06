@@ -1,0 +1,307 @@
+# Hebrew Nemotron 3.5 ASR fine-tuning configuration
+# Based on: https://huggingface.co/blog/nvidia/fine-tuning-nemotron-35-asr
+
+project:
+  target_lang: he-IL          # Native Nemotron prompt slot for Hebrew
+  hebrew_only: true            # Hebrew transcripts + forced he-IL langID prompt only
+  base_model: nvidia/nemotron-3.5-asr-streaming-0.6b
+  nemo_branch: main
+
+readiness:
+  min_train_hours: 100          # check_ready.py threshold for full training run
+
+data:
+  out_dir: ./data
+  sample_rate: 16000
+  min_duration: 0.5
+  max_duration: 30.0
+  # Split policy (see scripts/build_dataset.py):
+  #   train  = VoxKnesset + synthetic + podcasts + ivrit.ai sources (deduped)
+  #   dev    = first 6k VoxKnesset test clips (3k val batches × batch 2); rest -> train
+  #   test   = ivrit.ai eval suite (eval-d1, whatsapp, SASpeech, FLEURS, CV, Kan)
+  splits:
+    validation: voxknesset_test
+    test: eval_benchmarks
+  asr_transcition:
+    root: /mnt/windows_nvme/asr_transcition
+    # Folder name says "hebrew-ipa" but we use punctuated Hebrew transcript, NOT IPA phonemes.
+    voxknesset_hebrew_ipa:
+      manifest: ivrit/VoxKnesset-hebrew-ipa/manifest.jsonl
+      audio_dir: ivrit/VoxKnesset-hebrew-ipa/clips
+      text_field: transcript          # Hebrew text — NOT whisper_phonemes / ipa fields
+      forbidden_text_fields:
+        - whisper_phonemes
+        - phonemes
+        - ipa
+      wav_field: wav
+      duration_field: duration_sec
+      speaker_field: speaker_id
+      confidence_field: whisper_confidence
+      vad_field: vad_speech_ratio
+    # ~102K earlier clip set (same schema, wav next to manifest)
+    voxknesset_clips:
+      manifest: ivrit/VoxKnesset-clips/manifest.jsonl
+      audio_dir: ivrit/VoxKnesset-clips
+      text_field: transcript          # Hebrew text — NOT reference_text / phonemes
+      forbidden_text_fields:
+        - whisper_phonemes
+        - phonemes
+      wav_field: wav
+      duration_field: duration_sec
+      speaker_field: speaker_id
+      confidence_field: whisper_confidence
+      vad_field: vad_speech_ratio
+    # Speaker-disjoint split (hash-stable; no sentence leakage across speakers)
+    test_speaker_frac: 0.05
+    dev_speaker_frac: 0.05
+    min_whisper_confidence: 0.35
+    min_vad_speech_ratio: 0.5
+  # Synthetic Hebrew TTS — notmax123/large-he-synthetic-tts-dataset
+  # Source wav (44.1 kHz): /home/maxm/AE_training_data_all/slow_44K/data/  (canonical — do not duplicate)
+  # This repo keeps metadata + 16 kHz resample cache only (~95 GB wav_16k)
+  synthetic:
+    enabled: true
+    hf_repo: notmax123/large-he-synthetic-tts-dataset
+    archive_name: large-he-synthetic-tts-dataset.tar.zst
+    local_dir: ./data/synthetic                    # metadata + wav_16k cache only
+    audio_root: /home/maxm/AE_training_data_all/slow_44K/data
+    metadata_file: metadata_wer_025.csv   # 581K clips / 859 h (WER < 0.25)
+    # metadata_file: metadata_wer_02.csv  # 521K / 734 h
+    # metadata_file: metadata_wer0.csv    # 156K / 140 h (WER == 0)
+    resampled_subdir: wav_16k             # 16 kHz clips for NeMo (from AE source via resample)
+    text_mode: unvocalized                # strip niqqud for Nemotron-style targets
+    delimiter: "|"
+    columns:
+      id: id
+      text: text                          # NOT phonemes
+    test_speaker_frac: 0.05
+    dev_speaker_frac: 0.05
+  # Podcast segments — aunikud harvest (Whisper transcripts in music-clean pass)
+  podcasts:
+    enabled: true
+    root: /home/maxm/aunikud/aunikud-data-harvest/podcast_segments
+    audio_dir: segments
+    transcripts_tsv: /home/maxm/aunikud/aunikud-data-harvest/podcast_segments_music_clean/transcripts_ivrit_conf.tsv
+    delimiter: "\t"
+    columns:
+      segment_id: segment_id
+      text: text                          # NOT phonemes (see transcripts_ivrit_phonemes.tsv)
+      duration: duration_sec
+      confidence: token_confidence
+      segment_path: segment_path
+      speaker_id: youtube_id
+    min_token_confidence: 0.35
+    test_speaker_frac: 0.05
+    dev_speaker_frac: 0.05
+  # ivrit.ai HF training corpora (scripts/build_ivrit_sources.py) — deduped on merge
+  # Storage budget: keep ~100 GB free on /mnt/windows_nvme (1.8 TB disk).
+  #   crowd-transcribe-v5 + crowd-recital: complete (~22 GB raw + ~34 GB clip cache)
+  #   knesset-committees: partial only (~61 GB / 827 GB on disk) — export ~394 h, ~89 GB cache
+  #   audio-v2: disabled (~1.2 TB full — does not fit)
+  ivrit_sources:
+    enabled: true
+    clip_cache: ./data/ivrit_clips
+    min_segment_quality: 0.7      # ivrit.ai downstream threshold
+    min_session_quality: 0.3        # skip corrupt / empty sessions
+    process_order:
+      - crowd-transcribe-v5
+      - crowd-recital
+      - knesset-committees
+    sources:
+      crowd-transcribe-v5:
+        enabled: true
+        download: true
+        hf_repo: ivrit-ai/crowd-transcribe-v5
+        local_dir: /mnt/windows_nvme/asr_transcition/ivrit/crowd-transcribe-v5
+        split: train                # exclude HF test split from training
+        id_field: uuid
+        text_field: sentence
+      crowd-recital:
+        enabled: true
+        download: true
+        hf_repo: ivrit-ai/crowd-recital
+        local_dir: /mnt/windows_nvme/asr_transcition/ivrit/crowd-recital
+        source_type: crowd_recital
+        source_id: recital
+      knesset-committees:
+        enabled: true
+        download: true              # resume until min_free_gb on /mnt/windows_nvme (not full 827 GB)
+        min_free_gb: 120            # stop download when disk free drops below this (~100 GB reserve + buffer)
+        hf_repo: ivrit-ai/knesset-committees
+        local_dir: /mnt/windows_nvme/asr_transcition/ivrit/knesset-committees
+        source_type: knesset
+        source_id: committee
+      audio-v2:
+        enabled: false              # ~1.2 TB — excluded (insufficient storage)
+        download: false
+        hf_repo: ivrit-ai/audio-v2
+        local_dir: /mnt/windows_nvme/asr_transcition/ivrit/audio-v2
+  # Optional: FLEURS Hebrew (training export via build_dataset --source fleurs)
+  fleurs:
+    dataset: google/fleurs
+    config: he_il
+  # Optional: Common Voice Hebrew — point cv_dir at extracted CV release
+  common_voice:
+    enabled: false
+    cv_dir: ./cv-corpus-26.0/he
+    delimiter: "\t"
+    columns:
+      text: sentence
+      audio_path: path
+      speaker_id: client_id
+  # For large-scale training: convert manifests to tarred shards (blog Step 1)
+  tarred:
+    enabled: false
+    num_shards: 8
+    target_dir: ./data/tarred
+
+training:
+  # NVIDIA tutorial + NeMo yaml defaults (telephony augmentations kept separately below):
+  # https://github.com/nvidia-riva/tutorials/blob/main/asr-finetune-nemotron-3.5-asr-streaming-prompt.ipynb
+  # fastconformer_transducer_bpe_streaming_prompt.yaml
+  lr: 0.05
+  warmup_steps: 100
+  sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
+  weight_decay: 0.001
+  optim_betas: [0.9, 0.98]
+  gradient_clip_val: 0.5
+  batch_duration: 16              # extremely small micro-batch to stay under X11 5s CUDA timeout
+  accumulate_grad_batches: 10   # effective batch 320s (16×10×2 GPUs)
+  max_clip_duration: 15            # hard-exclude clips >15s (~0.9% of train manifest)
+  precision: bf16
+  devices: 2
+  num_nodes: 1
+  num_workers: 4                  # yaml default
+  max_steps: null                 # yaml default 500k step budget
+  sync_batchnorm: true
+  save_top_k: 3                    # Lightning keeps top-k per run; synced to best / best_top2 / best_top3
+  checkpoint_sync_delay_sec: 180   # defer multi-GB best.* copies after val (avoid DDP stall)
+  exp_name: hebrew_ft
+  init_from_best: true           # load lowest val_wer checkpoint
+  resume_from_best: true         # full resume from best.ckpt (step, LR, optimizer) — not weights-only
+  wer_log: ./exp/hebrew_ft/wer.jsonl
+  val_interval_mode: optimizer_steps  # fraction | optimizer_steps
+  val_check_interval: 1000          # validate every N optimizer steps (global_step)
+  val_every_epoch: false
+  limit_val_batches: null         # full dev set (tutorial); set 3000 for faster val
+  val_log_examples: 2
+  log_every_n_steps: 100          # yaml default
+  # Phone-call augmentations: 16 kHz -> 8 kHz -> 16 kHz with varied resamplers
+  augmentation:
+    enabled: true
+    preset: telephony
+    register_custom_perturbations: true
+    noise_manifest: ./data/manifests/noise.json
+    noise_dirs:
+      - /mnt/windows_nvme/asr_transcition/musan/noise
+    telephony:
+      # Primary: narrowband round-trip at 8 kHz, random resample method each way
+      phone_8k_resample:
+        prob: 0.35
+        sr: 16000
+        phone_sr: 8000
+        same_method_up_down: false
+        resample_types:
+          - kaiser_fast
+          - kaiser_best
+          - scipy
+          - fft
+          - polyphase
+          - soxr_hq
+          - soxr_mq
+      speed:
+        prob: 0.5
+        sr: 16000
+        resample_type: kaiser_fast
+        min_speed_rate: 0.9
+        max_speed_rate: 1.1
+        num_rates: 3
+      shift:
+        prob: 0.3
+        min_shift_ms: 10.0
+        max_shift_ms: 50.0
+        direction: right
+      gain:
+        prob: 0.15
+        min_gain_dbfs: -10.0
+        max_gain_dbfs: 6.0
+        norm: true
+      white_noise:
+        prob: 0.1
+        min_level: -90
+        max_level: -55
+        norm: true
+      noise:
+        prob: 0.15
+        min_snr_db: 15
+        max_snr_db: 25
+        max_gain_db: 300.0
+        norm: true
+
+evaluation:
+  # Evaluate at deployment latency (blog: 80ms ultra-low, no lookahead)
+  att_context_size: [56, 0]
+  latency_label: "80 ms"
+  max_eval_duration: 600      # eval-d1 uses ~5 min chunks
+  manifest_dir: ./data/manifests/eval
+  # ivrit.ai-style Hebrew benchmark suite (~13 h total)
+  benchmarks:
+    ivrit_eval_d1:
+      enabled: true
+      dataset: ivrit-ai/eval-d1
+      split: test
+      text_field: text
+      id_field: uuid
+      description: "Manual podcast episode transcription (~2 h)"
+    ivrit_eval_whatsapp:
+      enabled: true
+      dataset: ivrit-ai/eval-whatsapp
+      split: test
+      text_field: text
+      id_field: uuid
+      gated: true
+      description: "Volunteer WhatsApp recordings (~1.2 h)"
+    saspeech:
+      enabled: true
+      dataset: upai-inc/saspeech
+      split: test
+      text_field: text
+      id_field: uuid
+      description: "SASpeech gold standard (~4 h)"
+    fleurs:
+      enabled: true
+      dataset: google/fleurs
+      config: he_il
+      split: test
+      text_field: transcription
+      id_field: id
+      description: "FLEURS Hebrew test (~2 h)"
+    common_voice:
+      enabled: true
+      dataset: mozilla-foundation/common_voice_17_0
+      config: he
+      split: validated
+      text_field: sentence
+      id_field: client_id
+      cv_dir: ./cv-corpus-17.0/he
+      description: "Common Voice 17 Hebrew validated (~2 h)"
+    hebrew_speech_kan:
+      enabled: true
+      dataset: imvladikon/hebrew_speech_kan
+      split: validation
+      text_field: sentence
+      id_field: sentence
+      description: "Kan YouTube validation (~1.7 h)"
+  # Full latency ladder (optional sweep)
+  latency_ladder:
+    - [[56, 0], "80 ms"]
+    - [[56, 1], "160 ms"]
+    - [[56, 3], "320 ms"]
+    - [[56, 6], "560 ms"]
+    - [[56, 13], "1120 ms"]
+
+inference:
+  att_context_size: [56, 0]   # 80 ms — phone / voice-agent latency (blog table)
+  strip_lang_tags: true
+  # Slightly higher accuracy for non-interactive transcription:
+  # att_context_size: [56, 3]

@@ -1,0 +1,32 @@
+# Data & artifacts
+data/
+wav/
+exp/
+checkpoints/
+*.nemo
+*.tar
+*.tar.gz
+preds_*.json
+out_*/
+NeMo/
+
+# Common Voice / FLEURS downloads
+cv-corpus-*/
+fleurs_cache/
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Logs & reports
+*.log
+showcase_result.json
+streaming_result.json
+tensorboard/
+
+# OS
+.DS_Store
+Thumbs.db

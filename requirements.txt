@@ -1,0 +1,2 @@
+# Dependencies are managed in pyproject.toml — install with: uv sync
+# This file is kept for reference only.

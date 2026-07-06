@@ -1,0 +1,33 @@
+[project]
+name = "nemotron-hebrew-asr-ft"
+version = "0.1.0"
+description = "Fine-tune Nemotron 3.5 ASR for Hebrew (he-IL) — phone-call telephony preset"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=0.23.0",
+    "datasets[audio]>=2.19.0",
+    "soundfile>=0.12.1",
+    "librosa>=0.10.0",
+    "resampy>=0.4.0",
+    "jiwer>=3.0.0",
+    "pyyaml>=6.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "numba==0.60.0",  # 0.66 breaks NeMo warprnnt_numba RNNT loss (Signature mismatch on step 0)
+    "torch>=2.11.0",
+    "torchaudio>=2.11.0",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
