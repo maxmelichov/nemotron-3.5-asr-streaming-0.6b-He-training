@@ -53,6 +53,36 @@ NIQQUD = re.compile(r"[֑-ׇ]")
 HEBREW = re.compile(r"[֐-׿]")
 
 
+class Skips:
+    """Counts why rows were dropped.
+
+    Every builder previously did `except Exception: continue`, so a missing ffmpeg made
+    each mp3 row vanish without a word and produced a near-empty manifest that looked
+    like a successful run. Failures are now counted and reported per source.
+    """
+
+    def __init__(self, source: str):
+        self.source = source
+        self.counts: dict[str, int] = {}
+        self.first_error: str = ""
+
+    def add(self, reason: str, detail: str = "") -> None:
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+        if reason == "decode" and not self.first_error:
+            self.first_error = detail
+
+    def report(self, kept: int) -> None:
+        if not self.counts:
+            return
+        total = sum(self.counts.values())
+        detail = ", ".join(f"{k}={v:,}" for k, v in sorted(self.counts.items()))
+        print(f"[{self.source}] skipped {total:,} ({detail}); kept {kept:,}", flush=True)
+        decoded = self.counts.get("decode", 0)
+        if decoded and decoded > max(kept, 1):
+            print(f"[{self.source}] WARNING: more rows failed to decode than were kept — "
+                  f"first error: {self.first_error}", flush=True)
+
+
 @dataclass
 class Row:
     audio_filepath: str
@@ -74,6 +104,20 @@ class Row:
 
 
 # --------------------------------------------------------------------------- text
+
+
+def safe_name(key: str, limit: int = 120) -> str:
+    """Filesystem-safe, length-bounded stem.
+
+    Source ids embed full episode titles in Hebrew; as UTF-8 those blow past the 255-byte
+    filename limit and libsndfile fails with a bare "System error". Keep a readable head
+    and append a hash so names stay unique.
+    """
+    import hashlib
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", key).strip("-") or "clip"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return f"{cleaned[:limit]}_{digest}"
 
 
 def normalize_text(text: str, *, strip_niqqud: bool = True) -> str:
@@ -137,6 +181,129 @@ def decode_file(path: Path, sample_rate: int = SAMPLE_RATE):
 # --------------------------------------------------------------------------- hub
 
 
+def decode_and_write(job: tuple) -> tuple:
+    """(key, payload, path, text, speaker) -> (path, duration, text, speaker) or error.
+
+    ffmpeg runs as a subprocess and soundfile releases the GIL, so a thread pool gives
+    near-linear speed-up here; single-threaded this stage ran at ~11 clips/s.
+    """
+    key, payload, path, text, speaker = job
+    try:
+        audio = decode_bytes(payload)
+    except Exception as error:  # noqa: BLE001
+        return ("decode", f"{type(error).__name__}: {error}", None, None, None)
+    try:
+        dur = write_clip(audio, path)
+    except Exception as error:  # noqa: BLE001
+        return ("write", f"{type(error).__name__}: {error}", None, None, None)
+    return ("ok", str(path.resolve()), dur, text, speaker)
+
+
+def run_jobs(jobs: list, workers: int):
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(decode_and_write, jobs))
+
+
+def _shard_worker(payload: tuple) -> tuple:
+    """Process one parquet shard end to end, in its own process.
+
+    Shard-level parallelism is what actually matters: with sequential shards the box sat
+    ~82% idle waiting on a single HF download stream, so the in-shard thread pool had
+    nothing to chew on. Each process now downloads and decodes its own shard.
+    """
+    kind, repo, shard, token, args, audio_dir = payload
+    rows: list[dict] = []
+    skipped: dict[str, int] = {}
+    first_error = ""
+
+    def note(reason: str, detail: str = "") -> None:
+        nonlocal first_error
+        skipped[reason] = skipped.get(reason, 0) + 1
+        if reason == "decode" and not first_error:
+            first_error = detail
+
+    if kind == "ivrit30s":
+        cols = ["segment_id", "audio", "text", "duration_sec", "token_confidence",
+                "vad_speech_ratio", "episode"]
+    else:
+        cols = ["uuid", "audio", "sentence"]
+
+    try:
+        batches = parquet_batches(repo, shard, token, cols, batch_size=args.workers * 2)
+    except Exception as error:  # noqa: BLE001
+        return ([], {"shard_open": 1}, f"{type(error).__name__}: {error}", 0.0)
+
+    total = 0.0
+    for batch in batches:
+        jobs = []
+        for r in batch:
+            if kind == "ivrit30s":
+                if r["token_confidence"] < args.min_confidence:
+                    note("confidence"); continue
+                if r["vad_speech_ratio"] < args.min_vad_ratio:
+                    note("vad"); continue
+                text = normalize_text(r["text"])
+                if not acceptable(text):
+                    note("text"); continue
+                key, speaker = str(r["segment_id"]), str(r["episode"])
+            else:
+                text = normalize_text(r.get("sentence") or "")
+                if not acceptable(text):
+                    note("text"); continue
+                key, speaker = str(r["uuid"]), ""
+            jobs.append((key, r["audio"]["bytes"], audio_dir / f"{safe_name(key)}.wav",
+                         text, speaker))
+        for status, a, dur, text, speaker in run_jobs(jobs, args.workers):
+            if status != "ok":
+                note(status, a); continue
+            if not (args.min_duration <= dur <= args.max_duration):
+                note("duration")
+                Path(a).unlink(missing_ok=True)
+                continue
+            total += dur
+            rows.append({"path": a, "dur": dur, "text": text, "speaker": speaker})
+    return (rows, skipped, first_error, total)
+
+
+def build_parquet_source(kind: str, repo: str, shards: list[str], out: Path,
+                         token: str, args) -> list[Row]:
+    import multiprocessing as mp
+
+    audio_dir = out / "audio" / kind
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    skips = Skips(kind)
+    rows: list[Row] = []
+    total = 0.0
+    budget = args.max_hours_per_source * 3600 if args.max_hours_per_source else float("inf")
+
+    payloads = [(kind, repo, shard, token, args, audio_dir) for shard in shards]
+    ctx = mp.get_context("spawn")
+    done = 0
+    with ctx.Pool(processes=args.shard_workers) as pool:
+        for shard_rows, skipped, first_error, shard_total in pool.imap_unordered(
+            _shard_worker, payloads
+        ):
+            done += 1
+            for reason, count in skipped.items():
+                for _ in range(count):
+                    skips.add(reason, first_error)
+            for r in shard_rows:
+                rows.append(Row(r["path"], r["dur"], r["text"], kind, r["speaker"]))
+            total += shard_total
+            print(f"[{kind}] shard {done}/{len(shards)}: {len(rows):,} clips, "
+                  f"{total/3600:.1f} h", flush=True)
+            if total >= budget:
+                print(f"[{kind}] hit {args.max_hours_per_source} h cap", flush=True)
+                pool.terminate()
+                break
+    skips.report(len(rows))
+    return rows
+
+
 def hub_files(repo: str, token: str, suffix: str) -> list[str]:
     from huggingface_hub import HfApi
 
@@ -168,37 +335,8 @@ def build_ivrit30s(out: Path, token: str, args) -> list[Row]:
     """notmax123/ivirits-audio-v2-30s -- FLAC + whisper transcript in parquet."""
     repo = "notmax123/ivirits-audio-v2-30s"
     shards = hub_files(repo, token, ".parquet")
-    print(f"[ivrit30s] {len(shards)} shards")
-    rows: list[Row] = []
-    budget = args.max_hours_per_source * 3600 if args.max_hours_per_source else float("inf")
-    total = 0.0
-    audio_dir = out / "audio" / "ivrit30s"
-    cols = ["segment_id", "audio", "text", "duration_sec", "token_confidence",
-            "vad_speech_ratio", "episode"]
-    for index, shard in enumerate(shards):
-        if total >= budget:
-            break
-        for batch in parquet_batches(repo, shard, token, cols):
-            for r in batch:
-                if total >= budget:
-                    break
-                if r["token_confidence"] < args.min_confidence:
-                    continue
-                if r["vad_speech_ratio"] < args.min_vad_ratio:
-                    continue
-                text = normalize_text(r["text"])
-                if not acceptable(text):
-                    continue
-                path = audio_dir / f"{r['segment_id']}.wav"
-                try:
-                    audio = decode_bytes(r["audio"]["bytes"])
-                except Exception:  # noqa: BLE001
-                    continue
-                dur = write_clip(audio, path)
-                total += dur
-                rows.append(Row(str(path.resolve()), dur, text, "ivrit30s", str(r["episode"])))
-        print(f"[ivrit30s] shard {index+1}/{len(shards)}: {len(rows):,} clips, {total/3600:.1f} h", flush=True)
-    return rows
+    print(f"[ivrit30s] {len(shards)} shards, {args.shard_workers} in parallel")
+    return build_parquet_source("ivrit30s", repo, shards, out, token, args)
 
 
 def build_voxknesset(out: Path, token: str, args) -> list[Row]:
@@ -262,7 +400,7 @@ def build_voxknesset(out: Path, token: str, args) -> list[Row]:
                     piece = audio[a:b]
                     if len(piece) < args.min_duration * SAMPLE_RATE:
                         continue
-                    path = audio_dir / clip["wav"]
+                    path = audio_dir / f"{safe_name(clip['wav'])}.wav"
                     dur = write_clip(piece, path)
                     total += dur
                     rows.append(Row(str(path.resolve()), dur, clip["text"], "voxknesset", clip["speaker"]))
@@ -274,34 +412,8 @@ def build_crowd_transcribe(out: Path, token: str, args) -> list[Row]:
     """ivrit-ai/crowd-transcribe-v5 -- human-corrected `sentence`."""
     repo = "ivrit-ai/crowd-transcribe-v5"
     shards = [f for f in hub_files(repo, token, ".parquet") if "/test-" not in f]
-    print(f"[crowd_transcribe] {len(shards)} train shards")
-    rows: list[Row] = []
-    audio_dir = out / "audio" / "crowd_transcribe"
-    budget = args.max_hours_per_source * 3600 if args.max_hours_per_source else float("inf")
-    total = 0.0
-    for index, shard in enumerate(shards):
-        if total >= budget:
-            break
-        for batch in parquet_batches(repo, shard, token, ["uuid", "audio", "sentence"]):
-            for r in batch:
-                if total >= budget:
-                    break
-                text = normalize_text(r.get("sentence") or "")
-                if not acceptable(text):
-                    continue
-                try:
-                    audio = decode_bytes(r["audio"]["bytes"])
-                except Exception:  # noqa: BLE001
-                    continue
-                dur = len(audio) / SAMPLE_RATE
-                if not (args.min_duration <= dur <= args.max_duration):
-                    continue
-                path = audio_dir / f"{str(r['uuid']).replace('/', '_')}.wav"
-                write_clip(audio, path)
-                total += dur
-                rows.append(Row(str(path.resolve()), dur, text, "crowd_transcribe"))
-        print(f"[crowd_transcribe] shard {index+1}/{len(shards)}: {len(rows):,} clips, {total/3600:.1f} h", flush=True)
-    return rows
+    print(f"[crowd_transcribe] {len(shards)} train shards, {args.shard_workers} in parallel")
+    return build_parquet_source("crowd_transcribe", repo, shards, out, token, args)
 
 
 def build_eval_whatsapp(out: Path, token: str, args) -> list[Row]:
@@ -319,7 +431,7 @@ def build_eval_whatsapp(out: Path, token: str, args) -> list[Row]:
                     audio = decode_bytes(r["audio"]["bytes"])
                 except Exception:  # noqa: BLE001
                     continue
-                path = audio_dir / f"{str(r['uuid']).replace('/', '_')}.wav"
+                path = audio_dir / f"{safe_name(str(r['uuid']))}.wav"
                 dur = write_clip(audio, path)
                 rows.append(Row(str(path.resolve()), dur, text, "eval_whatsapp"))
     print(f"[eval_whatsapp] {len(rows):,} clips, {sum(r.duration for r in rows)/3600:.2f} h")
@@ -370,7 +482,7 @@ def build_from_audio_dir(name: str, root: Path, out: Path, args,
         dur = len(audio) / SAMPLE_RATE
         if not (args.min_duration <= dur <= args.max_duration):
             continue
-        target = audio_dir / f"{path.stem}.wav"
+        target = audio_dir / f"{safe_name(path.stem)}.wav"
         write_clip(audio, target)
         total += dur
         rows.append(Row(str(target.resolve()), dur, text, name))
@@ -419,6 +531,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-confidence", type=float, default=0.35)
     ap.add_argument("--min-vad-ratio", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=13)
+    ap.add_argument("--workers", type=int, default=min(24, (os.cpu_count() or 8)),
+                    help="Decode/write threads inside one shard")
+    ap.add_argument("--shard-workers", type=int, default=min(12, max(1, (os.cpu_count() or 8) // 8)),
+                    help="Shards processed in parallel (each its own HF download stream)")
     return ap.parse_args()
 
 
@@ -431,11 +547,20 @@ def write_manifest(rows: list[Row], path: Path) -> None:
     print(f"wrote {path} — {len(rows):,} clips, {hours:.1f} h")
 
 
+def require_ffmpeg() -> None:
+    from shutil import which
+
+    if which("ffmpeg") is None:
+        sys.exit("ffmpeg not found. Most source audio is mp3/m4a and cannot be decoded "
+                 "without it (apt-get install -y ffmpeg).")
+
+
 def main() -> None:
     args = parse_args()
     token = os.environ.get("HF_TOKEN")
     if not token:
         sys.exit("Set HF_TOKEN")
+    require_ffmpeg()
     sources = args.source or ["all"]
     if "all" in sources:
         sources = ["ivrit30s", "voxknesset", "crowd_transcribe", "saspeech", "ranlevi",
