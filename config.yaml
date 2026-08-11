@@ -162,17 +162,29 @@ training:
   lr: 0.05
   warmup_steps: 100
   sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
+  # Train at the SAME cache-aware context we deploy/evaluate at. Previously this lived
+  # only under evaluation/inference, so the model was fine-tuned at the checkpoint's
+  # default context and then measured at another -- a silent train/serve mismatch.
+  att_context_size: [56, 13]      # 1120 ms lookahead (latency_ladder rung)
   weight_decay: 0.001
   optim_betas: [0.9, 0.98]
   gradient_clip_val: 0.5
-  batch_duration: 16              # extremely small micro-batch to stay under X11 5s CUDA timeout
-  accumulate_grad_batches: 10   # effective batch 320s (16×10×2 GPUs)
-  max_clip_duration: 15            # hard-exclude clips >15s (~0.9% of train manifest)
+  batch_duration: 100             # seconds of audio per micro-batch per GPU; raise to 200 if VRAM allows
+  accumulate_grad_batches: 1      # effective batch 200s global (100 x 1 x 2 GPUs)
+  max_clip_duration: 40            # 40 s clips train fine with duration-based bucketing
   precision: bf16
   devices: 2
   num_nodes: 1
   num_workers: 4                  # yaml default
-  max_steps: null                 # yaml default 500k step budget
+  # No fixed step budget: training continues while val_wer improves and is ended by
+  # the early-stopping callback below, not by an arbitrary max_steps.
+  max_steps: null
+  early_stopping:
+    enabled: true
+    monitor: val_wer
+    mode: min
+    patience: 5                   # stop after 5 consecutive validations with no improvement
+    min_delta: 0.001
   sync_batchnorm: true
   save_top_k: 3                    # Lightning keeps top-k per run; synced to best / best_top2 / best_top3
   checkpoint_sync_delay_sec: 180   # defer multi-GB best.* copies after val (avoid DDP stall)
@@ -181,7 +193,9 @@ training:
   resume_from_best: true         # full resume from best.ckpt (step, LR, optimizer) — not weights-only
   wer_log: ./exp/hebrew_ft/wer.jsonl
   val_interval_mode: optimizer_steps  # fraction | optimizer_steps
-  val_check_interval: 1000          # validate every N optimizer steps (global_step)
+  # Shakedown: 100 so problems surface fast. Raise to 1000 for the long run
+  # (scripts/finetune.py --val-interval 1000 overrides without editing this file).
+  val_check_interval: 100           # validate every N optimizer steps (global_step)
   val_every_epoch: false
   limit_val_batches: null         # full dev set (tutorial); set 3000 for faster val
   val_log_examples: 2
@@ -240,14 +254,14 @@ training:
 
 evaluation:
   # Evaluate at deployment latency (blog: 80ms ultra-low, no lookahead)
-  att_context_size: [56, 0]
-  latency_label: "80 ms"
+  att_context_size: [56, 13]
+  latency_label: "1120 ms"
   max_eval_duration: 600      # eval-d1 uses ~5 min chunks
   manifest_dir: ./data/manifests/eval
   # ivrit.ai-style Hebrew benchmark suite (~13 h total)
   benchmarks:
     ivrit_eval_d1:
-      enabled: true
+      enabled: false
       dataset: ivrit-ai/eval-d1
       split: test
       text_field: text
@@ -262,14 +276,14 @@ evaluation:
       gated: true
       description: "Volunteer WhatsApp recordings (~1.2 h)"
     saspeech:
-      enabled: true
+      enabled: false
       dataset: upai-inc/saspeech
       split: test
       text_field: text
       id_field: uuid
       description: "SASpeech gold standard (~4 h)"
     fleurs:
-      enabled: true
+      enabled: false
       dataset: google/fleurs
       config: he_il
       split: test
@@ -277,7 +291,7 @@ evaluation:
       id_field: id
       description: "FLEURS Hebrew test (~2 h)"
     common_voice:
-      enabled: true
+      enabled: false
       dataset: mozilla-foundation/common_voice_17_0
       config: he
       split: validated
@@ -286,7 +300,7 @@ evaluation:
       cv_dir: ./cv-corpus-17.0/he
       description: "Common Voice 17 Hebrew validated (~2 h)"
     hebrew_speech_kan:
-      enabled: true
+      enabled: false
       dataset: imvladikon/hebrew_speech_kan
       split: validation
       text_field: sentence
@@ -301,7 +315,7 @@ evaluation:
     - [[56, 13], "1120 ms"]
 
 inference:
-  att_context_size: [56, 0]   # 80 ms — phone / voice-agent latency (blog table)
+  att_context_size: [56, 13]  # 1120 ms — matches the trained context
   strip_lang_tags: true
   # Slightly higher accuracy for non-interactive transcription:
   # att_context_size: [56, 3]

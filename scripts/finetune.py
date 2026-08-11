@@ -86,6 +86,9 @@ def main() -> None:
     ap.add_argument("--batch-duration", type=int)
     ap.add_argument("--grad-accum", type=int, help="accumulate_grad_batches (effective batch = batch_duration x this x devices)")
     ap.add_argument("--devices", type=int)
+    ap.add_argument("--val-interval", type=int, help="Validate every N optimizer steps (config default: 100)")
+    ap.add_argument("--att-context", help='Encoder cache-aware context, e.g. "[56,13]"')
+    ap.add_argument("--no-early-stopping", action="store_true", help="Disable the early-stopping callback")
     ap.add_argument("--limit-train-batches", type=int, help="Cap training epoch length (optimizer steps, not micro-batches)")
     ap.add_argument("--tarred", action="store_true", help="Use tarred train shards from config")
     ap.add_argument("--no-augment", action="store_true", help="Disable train-time audio augmentation")
@@ -223,7 +226,9 @@ def main() -> None:
     opt_steps_per_epoch = limit_opt_steps if limit_opt_steps is not None else opt_steps_full
     step_note = f"max_steps={max_steps}" if max_steps is not None else "max_steps=NeMo default (500k)"
     val_interval_mode = train_cfg.get("val_interval_mode", "fraction")
-    val_check_cfg = train_cfg.get("val_check_interval", 0.5)
+    val_check_cfg = args.val_interval if args.val_interval is not None else train_cfg.get("val_check_interval", 0.5)
+    if args.val_interval is not None:
+        val_interval_mode = "optimizer_steps"
     val_every_epoch = train_cfg.get("val_every_epoch", False)
     val_every_epochs = None
     if val_interval_mode == "fraction" and not val_every_epoch:
@@ -319,6 +324,13 @@ def main() -> None:
         f"model.optim.sched.warmup_steps={train_cfg['warmup_steps']}",
         f"model.optim.sched.d_model={sched_d_model}",
     ]
+
+    # Cache-aware context. Without this the encoder keeps the checkpoint's own context
+    # while eval/inference run at config's att_context_size -- train/serve mismatch.
+    att_context = args.att_context or _hydra_value(train_cfg.get("att_context_size"))
+    if train_cfg.get("att_context_size") is not None or args.att_context:
+        parts.append(f"model.encoder.att_context_size={att_context}")
+        print(f"Cache-aware context (train == eval): att_context_size={att_context}")
     if max_steps is not None:
         parts.append(f"trainer.max_steps={max_steps}")
     parts.extend([
@@ -343,6 +355,22 @@ def main() -> None:
     ])
     if grad_clip is not None:
         parts.append(f"trainer.gradient_clip_val={grad_clip}")
+
+    # Stop on plateau rather than a fixed budget: keep training while val_wer improves.
+    early_cfg = train_cfg.get("early_stopping") or {}
+    if early_cfg.get("enabled") and not args.no_early_stopping:
+        parts.extend([
+            "++exp_manager.create_early_stopping_callback=true",
+            f"++exp_manager.early_stopping_callback_params.monitor={early_cfg.get('monitor', 'val_wer')}",
+            f"++exp_manager.early_stopping_callback_params.mode={early_cfg.get('mode', 'min')}",
+            f"++exp_manager.early_stopping_callback_params.patience={early_cfg.get('patience', 5)}",
+            f"++exp_manager.early_stopping_callback_params.min_delta={early_cfg.get('min_delta', 0.001)}",
+        ])
+        print(
+            f"Early stopping: monitor={early_cfg.get('monitor', 'val_wer')} "
+            f"patience={early_cfg.get('patience', 5)} "
+            f"(no max_steps cap — training runs while val_wer improves)"
+        )
     if val_every_epochs is not None:
         parts.append(f"+trainer.check_val_every_n_epoch={val_every_epochs}")
     if limit_opt_steps is not None:

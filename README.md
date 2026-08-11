@@ -4,6 +4,37 @@ End-to-end implementation of NVIDIA's [Nemotron 3.5 ASR fine-tuning workflow](ht
 
 Hebrew is an **adaptation-ready** locale in [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) — the tokenizer recognizes it, but in-domain fine-tuning unlocks production-quality transcription.
 
+## Data (Hugging Face native)
+
+`scripts/build_hf_manifests.py` pulls everything from the Hub — no `/mnt/windows_nvme`
+or `/home/maxm` paths required:
+
+| Source | Repo | Notes |
+|---|---|---|
+| `ivrit30s` | `notmax123/ivirits-audio-v2-30s` | 2–30 s VAD segments + whisper text |
+| `voxknesset` | `notmax123/voxknesset-hebrew-ipa` ⋈ `ivrit-ai/VoxKnesset` | transcripts joined to audio on `source_filename`, cut at `[start_sec, end_sec]` |
+| `crowd_transcribe` | `ivrit-ai/crowd-transcribe-v5` | human-corrected `sentence` |
+| `saspeech` | `notmax123/SASPEECH_AUTO_clean` | 7z archive |
+| `ranlevi` | `notmax123/RanLevi40h` | 7z archive |
+| `synthetic` | `notmax123/SententicDataTTS` | 7z archive; uses the `text` column, never the phoneme columns |
+| `eval_whatsapp` | `ivrit-ai/eval-whatsapp` | the only held-out benchmark |
+
+```bash
+uv run scripts/build_hf_manifests.py --source all
+uv run scripts/build_hf_manifests.py --source ivrit30s --max-hours-per-source 500
+```
+
+Dev is a small **stratified** sample of the training sources (`--dev-hours`, default 2 h),
+so every source is represented without burning eval time.
+
+Two repos in the original request are intentionally absent:
+
+- `ivrit-ai/VoxKnesset` alone has **no transcript column** (`speaker_id`/`age`/`gender`/`audio`
+  only — it is an age/demographics corpus). The Hebrew text lives in
+  `notmax123/voxknesset-hebrew-ipa`, which the `voxknesset` source joins against.
+- `ivrit-ai/audio-transcripts` has **no audio column** — it is the transcript layer for
+  `audio-v2`, already represented by `ivrit30s`.
+
 ## Your data
 
 | Dataset | Path | Clips | Notes |
@@ -44,6 +75,36 @@ Or: `./run.sh ready --fix` then `./run.sh train`
 All commands use **`uv run`** — no manual venv activation needed.
 
 ## Pipeline
+
+## Training control
+
+- **Cache-aware context is now applied during training**, not just at eval:
+  `training.att_context_size: [56, 13]` (1120 ms) becomes
+  `model.encoder.att_context_size=[56,13]`. Previously the model was fine-tuned at the
+  checkpoint's default context and then measured at another — a silent train/serve mismatch.
+- **No fixed step budget.** `training.max_steps: null`; the run continues while `val_wer`
+  improves and is ended by early stopping (`patience: 5` on `val_wer`).
+- **Validation cadence**: `val_check_interval: 100` for the shakedown, then
+  `--val-interval 1000` for the long run.
+
+```bash
+uv run scripts/finetune.py --val-interval 100    # shakedown
+uv run scripts/finetune.py --val-interval 1000   # long run
+uv run scripts/finetune.py --att-context "[56,0]" --no-early-stopping
+```
+
+## Running inside the NVIDIA NeMo container
+
+`nvcr.io/nvidia/nemo:25.07` ships NeMo 2.4.1, which predates the prompt-conditioned
+cache-aware streaming support this recipe needs. `scripts/setup_nemo_container.sh` clones
+NeMo main alongside it and shadows the installed package via `PYTHONPATH` (so the
+container's tuned torch build is left alone), upgrades `lhotse`, and stubs the
+unpublished `nv_one_logger` telemetry package:
+
+```bash
+bash scripts/setup_nemo_container.sh
+export NEMO_ROOT=/root/NeMo-main PYTHONPATH=/root/stubs
+```
 
 ## Requirements
 
