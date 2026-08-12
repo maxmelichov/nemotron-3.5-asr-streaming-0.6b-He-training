@@ -84,8 +84,10 @@ All commands use **`uv run`** — no manual venv activation needed.
   checkpoint's default context and then measured at another — a silent train/serve mismatch.
 - **No fixed step budget.** `training.max_steps: null`; the run continues while `val_wer`
   improves and is ended by early stopping (`patience: 5` on `val_wer`).
-- **Validation cadence**: `val_check_interval: 100` for the shakedown, then
-  `--val-interval 1000` for the long run.
+- **Validation cadence**: `val_check_interval: 1000` is the default, for the long run.
+  Pass `--val-interval 100` for a deliberate shakedown. Note that `patience` counts
+  *validations*, not steps, so this interval also sets the early-stopping leash:
+  1000 x patience 5 = 5,000 steps of grace, whereas 100 kills the run after 600.
 
 ```bash
 uv run scripts/finetune.py --val-interval 100    # shakedown
@@ -189,7 +191,8 @@ Fine-tuning follows the official NeMo recipe:
 - Script: `NeMo/examples/asr/speech_to_text_finetune.py`
 - Config: `fastconformer_transducer_bpe_streaming_prompt.yaml`
 - Init: `init_from_nemo_model` from base `.nemo`
-- Optimizer: AdamW + NoamAnnealing (`lr=0.1`, `warmup_steps=500`)
+- Optimizer: AdamW + NoamAnnealing (`lr=0.1`, `warmup_steps=2500` — peak LR 6.3e-5,
+  since NoamAnnealing treats `lr` as a scale factor: `peak = lr * d_model^-0.5 / sqrt(warmup)`)
 - Schedule: **step budget** (`max_steps=8000`), not epochs
 - Tokenizer: reused from base model (recommended for < 50 h)
 
