@@ -163,8 +163,14 @@ training:
   # NVIDIA tutorial + NeMo yaml defaults (telephony augmentations kept separately below):
   # https://github.com/nvidia-riva/tutorials/blob/main/asr-finetune-nemotron-3.5-asr-streaming-prompt.ipynb
   # fastconformer_transducer_bpe_streaming_prompt.yaml
-  lr: 0.05
-  warmup_steps: 100
+  # NoamAnnealing treats `lr` as a scale factor: peak = lr * d_model^-0.5 / sqrt(warmup).
+  # The tutorial's 0.05/100 peaks at 1.6e-4 by step 100, which diverged here -- val_wer
+  # went 51.1% -> 58.4% and never recovered, and early stopping killed the run at step 600.
+  # 0.1/2500 peaks at 6.3e-5: ~2.5x gentler, reached over 2.5k steps rather than 100,
+  # which matters because the model is adapting to Hebrew AND to a fixed [56,13] context
+  # at the same time.
+  lr: 0.1
+  warmup_steps: 2500
   sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
   # Train at the SAME cache-aware context we deploy/evaluate at. Previously this lived
   # only under evaluation/inference, so the model was fine-tuned at the checkpoint's
@@ -197,9 +203,10 @@ training:
   resume_from_best: true         # full resume from best.ckpt (step, LR, optimizer) — not weights-only
   wer_log: ./exp/hebrew_ft/wer.jsonl
   val_interval_mode: optimizer_steps  # fraction | optimizer_steps
-  # Shakedown: 100 so problems surface fast. Raise to 1000 for the long run
-  # (scripts/finetune.py --val-interval 1000 overrides without editing this file).
-  val_check_interval: 100           # validate every N optimizer steps (global_step)
+  # patience is counted in VALIDATIONS, so this interval sets the real leash:
+  # 100 x patience 5 = the run dies after 600 steps (~6 min), which is what happened.
+  # 1000 gives 5,000 steps of grace. Use --val-interval 100 for a deliberate shakedown.
+  val_check_interval: 1000          # validate every N optimizer steps (global_step)
   val_every_epoch: false
   limit_val_batches: null         # full dev set (tutorial); set 3000 for faster val
   val_log_examples: 2

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,7 +56,15 @@ def streaming_eval(
         f"cuda=0"
     )
     print("+", cmd, flush=True)
-    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # The infer script ships with NEMO_ROOT but `import nemo` resolves to whatever is
+    # installed in the venv (an older /opt/NeMo on the training box). finetune.py already
+    # pins PYTHONPATH to NEMO_ROOT for exactly this reason -- eval must match, or the
+    # model evaluates under a different NeMo than it trained with (or crashes outright
+    # on missing symbols, as it did with get_inference_device).
+    env = os.environ.copy()
+    # .../NeMo-main/examples/asr/asr_cache_aware_streaming/<script> -> NeMo-main
+    env["PYTHONPATH"] = str(infer_script.parents[3]) + os.pathsep + env.get("PYTHONPATH", "")
+    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     print(res.stdout[-3000:], flush=True)
     if res.returncode != 0:
         raise RuntimeError(f"Streaming infer failed (rc={res.returncode})")
