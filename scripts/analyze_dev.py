@@ -5,7 +5,12 @@ import re
 import sys
 from collections import defaultdict
 
-NIKUD = re.compile(r"[֑-ׇ]")  # cantillation + vowel points
+# Combining marks only: cantillation (U+0591-U+05AF), vowel points (U+05B0-U+05BD),
+# rafe, shin/sin dots, and qamats qatan. The naive range U+0591-U+05C7 also swallows the
+# Hebrew *punctuation* in that block -- maqaf U+05BE, paseq U+05C0, sof pasuq U+05C3,
+# nun hafukha U+05C6 -- which are plain punctuation in unvocalized text and would flag
+# nearly every row as nikud.
+NIKUD = re.compile("[\u0591-\u05bd\u05bf\u05c1\u05c2\u05c4\u05c5\u05c7]")
 
 path = sys.argv[1] if len(sys.argv) > 1 else "/root/data/manifests/dev.json"
 rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]

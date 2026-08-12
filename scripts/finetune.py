@@ -71,6 +71,58 @@ def ensure_train_deps() -> None:
     )
 
 
+def check_resumed_schedule(
+    info: dict, ckpt: Path, lr: float, warmup_steps: int, explicit: bool
+) -> None:
+    """Abort if a full resume would silently reinstate the checkpoint's LR schedule.
+
+    Lightning restores scheduler state wholesale, so `model.optim.sched.*` on the command
+    line is ignored on resume: the banner prints the new schedule while the optimizer runs
+    the old one. Run 1 diverged (51% -> 58% WER) on the schedule baked into best.ckpt, so
+    resuming into it is almost never what the caller means -- hence a hard stop rather than
+    a warning, unless they named the checkpoint explicitly with --resume-checkpoint.
+    """
+    ckpt_warmup = info.get("sched_warmup_steps")
+    ckpt_base_lrs = info.get("sched_base_lrs")
+    if ckpt_warmup is None and ckpt_base_lrs is None:
+        print(
+            f"WARNING: no readable LR scheduler state in {ckpt} "
+            "(expected lr_schedulers[0] with warmup_steps/base_lrs).\n"
+            f"WARNING: if it does carry one, Lightning will restore it and the configured "
+            f"warmup={warmup_steps:,}/lr={lr:g} will be ignored — check the logged LR early "
+            "in the run.",
+            flush=True,
+        )
+        return
+
+    mismatches = []
+    if ckpt_warmup is not None and ckpt_warmup != warmup_steps:
+        mismatches.append(
+            f"warmup_steps: checkpoint has {ckpt_warmup:,}, configured {warmup_steps:,}"
+        )
+    if ckpt_base_lrs is not None and any(abs(b - lr) > 1e-12 for b in ckpt_base_lrs):
+        shown = ", ".join(f"{b:g}" for b in ckpt_base_lrs)
+        mismatches.append(f"base lr: checkpoint has {shown}, configured {lr:g}")
+    if not mismatches:
+        return
+
+    detail = "\n".join(f"  - {m}" for m in mismatches)
+    if explicit:
+        print(
+            f"WARNING: --resume-checkpoint was given explicitly, so {ckpt} keeps its own LR "
+            f"schedule and these settings are ignored:\n{detail}",
+            flush=True,
+        )
+        return
+    sys.exit(
+        f"LR schedule mismatch — refusing to resume from {ckpt}:\n{detail}\n"
+        "Lightning restores the scheduler from the checkpoint, so the run would train on the\n"
+        "checkpoint's schedule while the log claims otherwise.\n"
+        "  --no-resume                  load best .nemo weights only, start the new schedule\n"
+        f"  --resume-checkpoint {ckpt}  keep the checkpoint's old schedule on purpose"
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(repo_root() / "config.yaml"))
@@ -89,7 +141,9 @@ def main() -> None:
     ap.add_argument("--batch-duration", type=int)
     ap.add_argument("--grad-accum", type=int, help="accumulate_grad_batches (effective batch = batch_duration x this x devices)")
     ap.add_argument("--devices", type=int)
-    ap.add_argument("--val-interval", type=int, help="Validate every N optimizer steps (config default: 100)")
+    ap.add_argument("--val-interval", type=int,
+                    help="Validate every N optimizer steps (config default: 1000). patience counts "
+                         "validations, so this also sets the early-stopping leash")
     ap.add_argument("--att-context", help='Encoder cache-aware context, e.g. "[56,13]"')
     ap.add_argument("--no-early-stopping", action="store_true", help="Disable the early-stopping callback")
     ap.add_argument("--limit-train-batches", type=int, help="Cap training epoch length (optimizer steps, not micro-batches)")
@@ -162,6 +216,11 @@ def main() -> None:
     elif args.dry_run and not base_nemo.exists():
         base_nemo = Path("checkpoints/nemotron-3.5-asr-base.nemo")
 
+    # Resolved before the resume block so check_resumed_schedule() can compare them
+    # against the schedule stored in the checkpoint.
+    lr = args.lr if args.lr is not None else train_cfg["lr"]
+    warmup_steps = args.warmup if args.warmup is not None else train_cfg["warmup_steps"]
+
     link_dir = args.exp_dir / exp_name
     resume_ckpt: Path | None = None
     if args.resume_checkpoint:
@@ -192,6 +251,9 @@ def main() -> None:
                 f"Full resume: {resume_ckpt}{wer_note}, "
                 f"global_step={info['global_step']:,}, epoch={info['epoch']}"
             )
+            check_resumed_schedule(
+                info, resume_ckpt, lr, warmup_steps, explicit=bool(args.resume_checkpoint)
+            )
         else:
             print(f"Full resume: {resume_ckpt}{wer_note} (optimizer + LR schedule restored from ckpt)")
 
@@ -204,8 +266,7 @@ def main() -> None:
     cfg_name = "fastconformer_transducer_bpe_streaming_prompt"
 
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("max_steps")
-    lr = args.lr if args.lr is not None else train_cfg["lr"]
-    warmup_steps = args.warmup if args.warmup is not None else train_cfg["warmup_steps"]
+    # lr / warmup_steps resolved above, before the resume-schedule check.
     batch_duration = args.batch_duration or train_cfg["batch_duration"]
     devices = args.devices or train_cfg["devices"]
     grad_accum = args.grad_accum or train_cfg.get("accumulate_grad_batches", 1)

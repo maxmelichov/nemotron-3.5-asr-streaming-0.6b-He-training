@@ -846,14 +846,38 @@ def _scan_best_val_wer_ckpt(root: Path) -> tuple[Path, float] | None:
 
 
 def read_checkpoint_resume_info(ckpt_path: Path) -> dict:
-    """Lightning ckpt metadata for resume logging (global_step, epoch)."""
+    """Lightning ckpt metadata for resume logging, plus the LR schedule it will restore.
+
+    On resume Lightning calls load_state_dict on the scheduler, and NoamAnnealing
+    inherits _LRScheduler's dict-based state_dict/load_state_dict — so warmup_steps and
+    base_lrs come back from the checkpoint and silently override whatever the config or
+    CLI asked for. Callers need to see those values to detect the clobber.
+
+    sched_warmup_steps / sched_base_lrs are None when the checkpoint carries no
+    recognizable scheduler state; that is reported, never assumed to be a match.
+    """
     import torch
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    return {
+    info = {
         "global_step": int(ckpt.get("global_step") or 0),
         "epoch": int(ckpt.get("epoch") or 0),
+        "sched_warmup_steps": None,
+        "sched_base_lrs": None,
     }
+    scheds = ckpt.get("lr_schedulers") or []
+    if scheds and isinstance(scheds[0], dict):
+        state = scheds[0]
+        warmup = state.get("warmup_steps")
+        if isinstance(warmup, (int, float)) and not isinstance(warmup, bool):
+            info["sched_warmup_steps"] = int(warmup)
+        base_lrs = state.get("base_lrs")
+        if isinstance(base_lrs, (list, tuple)) and base_lrs:
+            try:
+                info["sched_base_lrs"] = [float(x) for x in base_lrs]
+            except (TypeError, ValueError):
+                pass
+    return info
 
 
 def find_best_checkpoint(exp_dir: Path, exp_name: str = "hebrew_ft") -> tuple[Path, float] | None:
