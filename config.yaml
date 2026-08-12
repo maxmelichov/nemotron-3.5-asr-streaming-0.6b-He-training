@@ -166,10 +166,11 @@ training:
   # NoamAnnealing treats `lr` as a scale factor: peak = lr * d_model^-0.5 / sqrt(warmup).
   # The tutorial's 0.05/100 peaks at 1.6e-4 by step 100, which diverged here -- val_wer
   # went 51.1% -> 58.4% and never recovered, and early stopping killed the run at step 600.
-  # 0.1/2500 peaks at 6.3e-5: ~2.5x gentler, reached over 2.5k steps rather than 100,
-  # which matters because the model is adapting to Hebrew AND to a fixed [56,13] context
-  # at the same time.
-  lr: 0.1
+  # This is a new-language acquisition on 22.9k h, not a light fine-tune, so the peak is
+  # kept hot (1.25e-4, ~80% of the one that diverged) -- what changed is the approach:
+  # 2500 steps of ramp instead of 100, so the model adapts to Hebrew and the fixed
+  # [56,13] context before the LR gets dangerous.
+  lr: 0.2
   warmup_steps: 2500
   sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
   # Train at the SAME cache-aware context we deploy/evaluate at. Previously this lived
@@ -179,8 +180,10 @@ training:
   weight_decay: 0.001
   optim_betas: [0.9, 0.98]
   gradient_clip_val: 0.5
-  batch_duration: 100             # seconds of audio per micro-batch per GPU; raise to 200 if VRAM allows
-  accumulate_grad_batches: 1      # effective batch 200s global (100 x 1 x 2 GPUs)
+  # 100 used only 47/97 GB per RTX PRO 6000 and ran at 1.62 it/s. 150 measures ~55 GB
+  # and 3.13 it/s -- roughly 2x the throughput with headroom against a mid-run OOM.
+  batch_duration: 150             # seconds of audio per micro-batch per GPU
+  accumulate_grad_batches: 1      # effective batch 300s global (150 x 1 x 2 GPUs)
   max_clip_duration: 40            # 40 s clips train fine with duration-based bucketing
   precision: bf16
   devices: 2

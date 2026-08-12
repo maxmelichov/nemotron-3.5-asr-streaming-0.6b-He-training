@@ -386,6 +386,9 @@ def main() -> None:
         *train_ds_overrides,
         f"model.validation_ds.manifest_filepath={dev_manifest.resolve()}",
         f"model.validation_ds.sample_rate={sample_rate}",
+        # Batch validation by duration like training -- the yaml default decoded a few
+        # clips at a time, which made each validation pass needlessly slow.
+        f"model.validation_ds.batch_duration=200",
         f"+model.validation_ds.default_prompt_mode=langID",
         f"model.optim.name=adamw",
         f"model.optim.lr={lr}",
