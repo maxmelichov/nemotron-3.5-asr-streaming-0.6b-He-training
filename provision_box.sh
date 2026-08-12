@@ -10,7 +10,8 @@ echo "==> System packages"
 apt-get update -qq
 # ffmpeg is not optional: most source audio is mp3/m4a and silently fails to decode
 # without it. p7zip for the .7z dataset archives.
-apt-get install -y -qq ffmpeg p7zip-full tmux
+# zstd: large-he-synthetic ships a .tar.zst that is streamed, not downloaded whole.
+apt-get install -y -qq ffmpeg p7zip-full tmux zstd
 
 echo "==> Python packages"
 pip install -q soundfile fsspec py7zr kaldialign editdistance jiwer

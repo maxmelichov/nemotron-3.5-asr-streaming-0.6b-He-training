@@ -43,6 +43,7 @@ import json
 import os
 import random
 import re
+import time
 import subprocess
 import sys
 import unicodedata
@@ -110,6 +111,28 @@ class Row:
 
 
 # --------------------------------------------------------------------------- text
+
+
+def with_retries(call, attempts: int = 6, base_delay: float = 2.0, label: str = ""):
+    """Retry a flaky Hub call with exponential backoff.
+
+    Pulling thousands of shards, a transient read/connection error is certain; without
+    this a single blip used to fail the entire source (2,343 shards for ivrit30s) rather
+    than just the one shard that hit it.
+    """
+    import time
+
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception as error:  # noqa: BLE001
+            if attempt == attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(f"retry {attempt + 1}/{attempts - 1} in {delay:.0f}s {label}: "
+                  f"{type(error).__name__}: {str(error)[:120]}", flush=True)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def safe_name(key: str, limit: int = 120) -> str:
@@ -235,8 +258,35 @@ def _shard_worker(payload: tuple) -> tuple:
     Shard-level parallelism is what actually matters: with sequential shards the box sat
     ~82% idle waiting on a single HF download stream, so the in-shard thread pool had
     nothing to chew on. Each process now downloads and decodes its own shard.
+
+    Most of these ~2,300 shards have never been fetched before, so the first request to
+    HF's CDN is often a cold-cache miss that stalls for 60-90s; the identical request
+    right after resolves in ~1s. That is retried here (whole shard, clean state each
+    attempt) rather than papered over with a longer timeout, which would just make a
+    genuinely stuck request take longer to give up on.
     """
     kind, repo, shard, token, args, audio_dir = payload
+    if kind == "ivrit30s":
+        cols = ["segment_id", "audio", "text", "duration_sec", "token_confidence",
+                "vad_speech_ratio", "episode"]
+    else:
+        cols = ["uuid", "audio", "sentence"]
+
+    attempts = getattr(args, "shard_retries", 3)
+    last_error = ""
+    for attempt in range(attempts):
+        rows, skipped, first_error, total = _shard_attempt(
+            repo, shard, token, args, audio_dir, kind, cols
+        )
+        if rows or not skipped.get("shard_error"):
+            return rows, skipped, first_error, total
+        last_error = first_error
+        if attempt < attempts - 1:
+            time.sleep(2 * (attempt + 1))
+    return [], {"shard_error": 1}, last_error, 0.0
+
+
+def _shard_attempt(repo, shard, token, args, audio_dir, kind, cols) -> tuple:
     rows: list[dict] = []
     skipped: dict[str, int] = {}
     first_error = ""
@@ -247,49 +297,55 @@ def _shard_worker(payload: tuple) -> tuple:
         if reason == "decode" and not first_error:
             first_error = detail
 
-    if kind == "ivrit30s":
-        cols = ["segment_id", "audio", "text", "duration_sec", "token_confidence",
-                "vad_speech_ratio", "episode"]
-    else:
-        cols = ["uuid", "audio", "sentence"]
-
-    try:
-        batches = parquet_batches(repo, shard, token, cols, batch_size=args.workers * 2)
-    except Exception as error:  # noqa: BLE001
-        return ([], {"shard_open": 1}, f"{type(error).__name__}: {error}", 0.0)
-
     total = 0.0
-    for batch in batches:
-        jobs = []
-        for r in batch:
-            if "audio" not in r:
-                note("no_audio_column")
-                continue
-            if kind == "ivrit30s":
-                if r["token_confidence"] < args.min_confidence:
-                    note("confidence"); continue
-                if r["vad_speech_ratio"] < args.min_vad_ratio:
-                    note("vad"); continue
-                text = normalize_text(r["text"])
-                if not acceptable(text):
-                    note("text"); continue
-                key, speaker = str(r["segment_id"]), str(r["episode"])
-            else:
-                text = normalize_text(r.get("sentence") or "")
-                if not acceptable(text):
-                    note("text"); continue
-                key, speaker = str(r["uuid"]), ""
-            jobs.append((key, r["audio"]["bytes"], audio_dir / f"{safe_name(key)}.wav",
-                         text, speaker))
-        for status, a, dur, text, speaker in run_jobs(jobs, args.workers):
-            if status != "ok":
-                note(status, a); continue
-            if not (args.min_duration <= dur <= args.max_duration):
-                note("duration")
-                Path(a).unlink(missing_ok=True)
-                continue
-            total += dur
-            rows.append({"path": a, "dur": dur, "text": text, "speaker": speaker})
+    try:
+        # parquet_batches() is a generator: calling it can never raise, only iterating it
+        # can. A try/except around just the call (the original bug) therefore caught
+        # nothing -- a mid-stream read error on ONE shard propagated straight out of the
+        # pool and killed the whole source (2,343 shards for ivrit30s, in production).
+        # Wrapping the whole body isolates that shard and keeps whatever rows had already
+        # been collected before the error hit.
+        #
+        # Download-then-read rather than the streaming hf:// filesystem: on at least one
+        # box a slow connection to the CDN just hung reading a shard instead of raising,
+        # so the retry above this frame never even triggered. hf_hub_download() goes
+        # through huggingface_hub's own HTTP stack, which actually times out.
+        cache_dir = audio_dir.parent / "_shard_cache"
+        batches = parquet_batches_local(repo, shard, token, cols,
+                                        batch_size=args.workers * 2, cache_dir=cache_dir)
+        for batch in batches:
+            jobs = []
+            for r in batch:
+                if "audio" not in r:
+                    note("no_audio_column")
+                    continue
+                if kind == "ivrit30s":
+                    if r["token_confidence"] < args.min_confidence:
+                        note("confidence"); continue
+                    if r["vad_speech_ratio"] < args.min_vad_ratio:
+                        note("vad"); continue
+                    text = normalize_text(r["text"])
+                    if not acceptable(text):
+                        note("text"); continue
+                    key, speaker = str(r["segment_id"]), str(r["episode"])
+                else:
+                    text = normalize_text(r.get("sentence") or "")
+                    if not acceptable(text):
+                        note("text"); continue
+                    key, speaker = str(r["uuid"]), ""
+                jobs.append((key, r["audio"]["bytes"], audio_dir / f"{safe_name(key)}.wav",
+                             text, speaker))
+            for status, a, dur, text, speaker in run_jobs(jobs, args.workers):
+                if status != "ok":
+                    note(status, a); continue
+                if not (args.min_duration <= dur <= args.max_duration):
+                    note("duration")
+                    Path(a).unlink(missing_ok=True)
+                    continue
+                total += dur
+                rows.append({"path": a, "dur": dur, "text": text, "speaker": speaker})
+    except Exception as error:  # noqa: BLE001
+        note("shard_error", f"{type(error).__name__}: {error}")
     return (rows, skipped, first_error, total)
 
 
@@ -309,43 +365,47 @@ def _vk_shard(payload: tuple) -> tuple:
     first_error = ""
     total = 0.0
     try:
+        # Whole body in one try/except, not just the open: parquet_batches() is a
+        # generator, so calling it can't raise -- only iterating it can, and a bare
+        # try around the call (the original bug) let a mid-stream read error on ONE
+        # shard escape the pool and take out the entire source.
         batches = parquet_batches(repo, shard, token, ["audio", "speaker_id"], batch_size=4)
-    except Exception as error:  # noqa: BLE001
-        return ([], {"shard_open": 1}, f"{type(error).__name__}: {error}", 0.0)
-
-    for batch in batches:
-        for r in batch:
-            if "audio" not in r:
-                # Repos carry stray parquet next to the audio shards (VoxKnesset ships a
-                # transcripts.parquet of (filename, text)). Skip rather than kill the pool.
-                skipped["no_audio_column"] = skipped.get("no_audio_column", 0) + 1
-                continue
-            clips = _VK_WANTED.get(r["audio"]["path"])
-            if not clips:
-                continue
-            try:
-                audio = decode_bytes(r["audio"]["bytes"])
-            except Exception as error:  # noqa: BLE001
-                skipped["decode"] = skipped.get("decode", 0) + 1
-                if not first_error:
-                    first_error = f"{type(error).__name__}: {error}"
-                continue
-            for clip in clips:
-                a, b = int(clip["start"] * SAMPLE_RATE), int(clip["end"] * SAMPLE_RATE)
-                piece = audio[a:b]
-                dur = len(piece) / SAMPLE_RATE
-                if not (args.min_duration <= dur <= args.max_duration):
-                    skipped["duration"] = skipped.get("duration", 0) + 1
+        for batch in batches:
+            for r in batch:
+                if "audio" not in r:
+                    # Repos carry stray parquet next to the audio shards (VoxKnesset
+                    # ships a transcripts.parquet of (filename, text)). Skip, don't fail.
+                    skipped["no_audio_column"] = skipped.get("no_audio_column", 0) + 1
                     continue
-                path = audio_dir / f"{safe_name(clip['wav'])}.wav"
+                clips = _VK_WANTED.get(r["audio"]["path"])
+                if not clips:
+                    continue
                 try:
-                    write_clip(piece, path)
+                    audio = decode_bytes(r["audio"]["bytes"])
                 except Exception as error:  # noqa: BLE001
-                    skipped["write"] = skipped.get("write", 0) + 1
+                    skipped["decode"] = skipped.get("decode", 0) + 1
+                    if not first_error:
+                        first_error = f"{type(error).__name__}: {error}"
                     continue
-                total += dur
-                rows.append({"path": str(path.resolve()), "dur": dur,
-                             "text": clip["text"], "speaker": clip["speaker"]})
+                for clip in clips:
+                    a, b = int(clip["start"] * SAMPLE_RATE), int(clip["end"] * SAMPLE_RATE)
+                    piece = audio[a:b]
+                    dur = len(piece) / SAMPLE_RATE
+                    if not (args.min_duration <= dur <= args.max_duration):
+                        skipped["duration"] = skipped.get("duration", 0) + 1
+                        continue
+                    path = audio_dir / f"{safe_name(clip['wav'])}.wav"
+                    try:
+                        write_clip(piece, path)
+                    except Exception as error:  # noqa: BLE001
+                        skipped["write"] = skipped.get("write", 0) + 1
+                        continue
+                    total += dur
+                    rows.append({"path": str(path.resolve()), "dur": dur,
+                                 "text": clip["text"], "speaker": clip["speaker"]})
+    except Exception as error:  # noqa: BLE001
+        skipped["shard_error"] = skipped.get("shard_error", 0) + 1
+        first_error = first_error or f"{type(error).__name__}: {error}"
     return (rows, skipped, first_error, total)
 
 
@@ -465,6 +525,53 @@ def parquet_batches(repo: str, path: str, token: str, columns: list[str] | None,
     handle = pq.ParquetFile(f"hf://datasets/{repo}/{path}", filesystem=fs)
     for batch in handle.iter_batches(batch_size=batch_size, columns=columns):
         yield batch.to_pylist()
+
+
+def curl_download(url: str, dest: Path, token: str, *, max_time: int = 60) -> None:
+    """Download with a hard, unambiguous timeout.
+
+    Both the hf:// fsspec filesystem and huggingface_hub's own HTTP stack were observed
+    hanging on this box's network path -- established connections sitting idle in
+    do_poll, no error, no data, no timeout firing. curl's --max-time is enforced by curl
+    itself, not by a library's session config that may or may not be wired up correctly,
+    so a stall is bounded no matter what is happening inside Python's HTTP libraries.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    result = subprocess.run(
+        ["curl", "-sL", "--fail", "--max-time", str(max_time),
+         "-H", f"Authorization: Bearer {token}", url, "-o", str(tmp)],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"curl rc={result.returncode}: {result.stderr.decode('utf-8', 'replace')[:200]}"
+        )
+    tmp.rename(dest)
+
+
+def parquet_batches_local(repo: str, path: str, token: str, columns: list[str] | None,
+                          batch_size: int, cache_dir: Path):
+    """Download a shard with curl (hard timeout), then read it locally.
+
+    Both the hf:// fsspec filesystem and hf_hub_download() were observed hanging
+    indefinitely on this box's network path rather than raising -- so a process-level
+    retry around either never even triggered. curl_download()'s --max-time bounds the
+    stall unambiguously.
+    """
+    import pyarrow.parquet as pq
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_path = cache_dir / f"{os.getpid()}_{Path(path).name}"
+    url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+    curl_download(url, local_path, token, max_time=150)
+    try:
+        handle = pq.ParquetFile(local_path)
+        for batch in handle.iter_batches(batch_size=batch_size, columns=columns):
+            yield batch.to_pylist()
+    finally:
+        local_path.unlink(missing_ok=True)
 
 
 def download(repo: str, filename: str, token: str, dest: Path) -> Path:
@@ -634,7 +741,7 @@ def build_crowd_recital(out: Path, token: str, args) -> list[Row]:
 
     files = HfApi(token=token).list_repo_files(repo, repo_type="dataset")
     sessions = sorted({f.split("/")[0] for f in files if f.endswith("/audio.mka")})
-    print(f"[crowd_recital] {len(sessions)} sessions, {args.shard_workers} in parallel")
+    print(f"[crowd_recital] {len(sessions)} sessions")
 
     audio_dir = out / "audio" / "crowd_recital"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -646,7 +753,12 @@ def build_crowd_recital(out: Path, token: str, args) -> list[Row]:
     payloads = [(repo, sid, token, args, audio_dir) for sid in sessions]
     ctx = pool_context()
     done = 0
-    with ctx.Pool(processes=args.shard_workers) as pool:
+    # Unlike the parquet sources (one big file per worker), this makes two small Hub API
+    # calls per session. At 96-way concurrency the Hub throttles and the run wedges with
+    # zero throughput, so cap it well below --shard-workers.
+    workers = max(1, min(args.shard_workers, 12))
+    print(f"[crowd_recital] using {workers} workers (small-file source)", flush=True)
+    with ctx.Pool(processes=workers) as pool:
         for sess_rows, skipped, first_error, sess_total in pool.imap_unordered(
             _recital_session, payloads
         ):
@@ -959,6 +1071,9 @@ def parse_args() -> argparse.Namespace:
                     help="Print the parquet schemas of a repo (audio/text column search) and exit")
     ap.add_argument("--rebuild", action="store_true",
                     help="Ignore per-source manifests from a previous run and redo them")
+    ap.add_argument("--shard-retries", type=int, default=3,
+                    help="Retries for a shard that failed outright (cold-cache timeouts "
+                         "on first access to an unfetched HF object are common)")
     ap.add_argument("--min-free-gb", type=float, default=60.0,
                     help="Stop staging a source when the volume drops below this, so "
                          "training still has room for checkpoints")
@@ -1025,6 +1140,7 @@ def main() -> None:
     out = args.out
     train_rows: list[Row] = []
     eval_rows: list[Row] = []
+    failed_sources: list[str] = []
 
     for name in sources:
         if name == "eval_whatsapp":
@@ -1037,7 +1153,25 @@ def main() -> None:
                       f"({sum(r.duration for r in cached)/3600:.1f} h)")
                 train_rows.extend(cached)
                 continue
-            built = BUILDERS[name](out, token, args)
+            try:
+                built = BUILDERS[name](out, token, args)
+            except Exception as error:  # noqa: BLE001
+                # A missing binary or a bad archive used to abort everything, including
+                # sources that had not run yet. Record and carry on; the source can be
+                # rerun on its own and completed ones are reused from checkpoint.
+                print(f"[{name}] FAILED, continuing without it: "
+                      f"{type(error).__name__}: {error}", flush=True)
+                failed_sources.append(name)
+                continue
+            if not built:
+                # A source can "succeed" with zero rows -- every shard hit an isolated
+                # per-shard error rather than raising. Checkpointing that as if it were a
+                # real (if small) result made a rerun silently reuse "0 clips" forever
+                # instead of retrying. Only checkpoint non-empty results.
+                print(f"[{name}] produced 0 rows -- NOT checkpointed, will retry next run",
+                      flush=True)
+                failed_sources.append(name)
+                continue
             write_source_manifest(built, out, name)
             train_rows.extend(built)
         elif name == "saspeech":
@@ -1079,6 +1213,9 @@ def main() -> None:
             print(f"  {src:18s} {sum(r.duration for r in rows_)/3600:8.1f} h  {len(rows_):>9,} clips")
     if eval_rows:
         write_manifest(eval_rows, out / "manifests" / "eval" / "eval_whatsapp.json")
+    if failed_sources:
+        print(f"\nWARNING: {len(failed_sources)} source(s) failed and are NOT in the "
+              f"manifest: {', '.join(failed_sources)}", flush=True)
 
 
 if __name__ == "__main__":
