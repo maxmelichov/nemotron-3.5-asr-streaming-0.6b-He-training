@@ -3,7 +3,11 @@
 
 project:
   target_lang: he-IL          # Native Nemotron prompt slot for Hebrew
-  hebrew_only: true            # Hebrew transcripts + forced he-IL langID prompt only
+  # false: keep Hebrew/English code-switching, which is normal in Israeli speech
+  # ("...the memory of מורינה ברבנו, of our נכסים..."). The he-IL prompt is still forced
+  # on every row; this only relaxes the majority-Hebrew-letters check on the transcript,
+  # which would otherwise drop 26,143 genuinely code-switched clips (0.32%).
+  hebrew_only: false
   base_model: nvidia/nemotron-3.5-asr-streaming-0.6b
   nemo_branch: main
 
