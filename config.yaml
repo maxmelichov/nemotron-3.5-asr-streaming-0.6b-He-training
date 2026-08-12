@@ -163,15 +163,24 @@ training:
   # NVIDIA tutorial + NeMo yaml defaults (telephony augmentations kept separately below):
   # https://github.com/nvidia-riva/tutorials/blob/main/asr-finetune-nemotron-3.5-asr-streaming-prompt.ipynb
   # fastconformer_transducer_bpe_streaming_prompt.yaml
-  # NoamAnnealing treats `lr` as a scale factor: peak = lr * d_model^-0.5 / sqrt(warmup).
-  # The tutorial's 0.05/100 peaks at 1.6e-4 by step 100, which diverged here -- val_wer
-  # went 51.1% -> 58.4% and never recovered, and early stopping killed the run at step 600.
-  # This is a new-language acquisition on 22.9k h, not a light fine-tune, so the peak is
-  # kept hot (1.25e-4, ~80% of the one that diverged) -- what changed is the approach:
-  # 2500 steps of ramp instead of 100, so the model adapts to Hebrew and the fixed
-  # [56,13] context before the LR gets dangerous.
-  lr: 0.2
-  warmup_steps: 2500
+  # NoamHoldAnnealing: warmup -> HOLD at peak -> polynomial decay. Chosen over
+  # NoamAnnealing because this is new-language acquisition, where the useful move is to
+  # sit at a high LR for a long time rather than start decaying the moment warmup ends.
+  #
+  # CAREFUL: under this scheduler `lr` is the ACTUAL peak learning rate. Under
+  # NoamAnnealing it was a scale factor (peak = lr * d_model^-0.5 / sqrt(warmup)), which
+  # is how run 1 shipped a 1.6e-4 peak while the config innocently read 0.05. Do not
+  # carry a scale-factor value (0.05 / 0.1 / 0.2) into this key -- it is a real LR now.
+  #
+  # 2.5e-4 sits in the 1e-4..5e-4 band used for adapting a pretrained multilingual ASR
+  # model to a new language, at the lower end of it because our 300 s global batch is
+  # small by the standards of those recipes (noisier gradients cap how hot you can go).
+  sched_name: NoamHoldAnnealing
+  lr: 2.5e-4                      # EXPLICIT peak LR (not a scale factor -- see above)
+  warmup_steps: 1000              # reach peak 2.5x sooner than the 2500-step ramp
+  hold_steps: 15000               # steps held AT peak after warmup (ends at step 16,000)
+  decay_rate: 0.25                # 0.5 == Noam's t^-0.5; 0.25 decays far slower
+  min_lr: 1.0e-6
   sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
   # Train at the SAME cache-aware context we deploy/evaluate at. Previously this lived
   # only under evaluation/inference, so the model was fine-tuned at the checkpoint's
