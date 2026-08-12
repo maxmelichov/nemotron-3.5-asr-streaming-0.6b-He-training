@@ -175,10 +175,16 @@ training:
   # 2.5e-4 sits in the 1e-4..5e-4 band used for adapting a pretrained multilingual ASR
   # model to a new language, at the lower end of it because our 300 s global batch is
   # small by the standards of those recipes (noisier gradients cap how hot you can go).
+  # Measured, not guessed -- peak LR vs val_wer on the same dev set (base = 50.55%):
+  #   2.5e-4  : 54.88 -> 50.92 -> 58.50   diverging
+  #   1.25e-4 : 51.39 -> 48.95 -> 52.33   oscillating (best reading we have: 48.95)
+  # Both were unstable, so the peak goes BELOW the better of the two, and the batch
+  # doubles (see accumulate_grad_batches) to halve gradient noise -- a 300 s global
+  # batch is small next to the 1000-4000 s used by recipes that run these LRs.
   sched_name: NoamHoldAnnealing
-  lr: 2.5e-4                      # EXPLICIT peak LR (not a scale factor -- see above)
-  warmup_steps: 1000              # reach peak 2.5x sooner than the 2500-step ramp
-  hold_steps: 15000               # steps held AT peak after warmup (ends at step 16,000)
+  lr: 1.0e-4                      # EXPLICIT peak LR (not a scale factor -- see above)
+  warmup_steps: 2000              # gentler ramp; 2.5e-4 in 1000 steps broke it
+  hold_steps: 20000               # steps held AT peak after warmup (ends at step 22,000)
   decay_rate: 0.25                # 0.5 == Noam's t^-0.5; 0.25 decays far slower
   min_lr: 1.0e-6
   sched_d_model: 1024             # must match encoder d_model (tutorial ++model.optim.sched.d_model=1024)
@@ -192,8 +198,18 @@ training:
   # 100 used only 47/97 GB per RTX PRO 6000 and ran at 1.62 it/s. 150 measures ~55 GB
   # and 3.13 it/s -- roughly 2x the throughput with headroom against a mid-run OOM.
   batch_duration: 150             # seconds of audio per micro-batch per GPU
-  accumulate_grad_batches: 1      # effective batch 300s global (150 x 1 x 2 GPUs)
-  max_clip_duration: 40            # 40 s clips train fine with duration-based bucketing
+  # 2, not 1: WER oscillated at every LR tried, the signature of gradient noise rather
+  # than a bad rate. This doubles the effective batch to 600 s global (150 x 2 x 2 GPUs)
+  # without extra VRAM, at the cost of half as many optimizer steps per wall-clock hour.
+  accumulate_grad_batches: 2      # effective batch 600s global (150 x 2 x 2 GPUs)
+  # 30 keeps essentially everything: only 3,530 clips (0.04%) exceed it, because the
+  # ivrit30s segmenter already emits 2-30 s. Note this is therefore nearly a no-op versus
+  # the previous 40 -- it is NOT a throughput or difficulty optimisation. The commit that
+  # produced a working [56,0] model used 15, which halves RNNT target length (the base
+  # tokenizer holds 121 Hebrew pieces in a 13k vocab, nearly all single characters, so
+  # Hebrew emits roughly one token per LETTER and cost scales with T x U) -- but 15 drops
+  # half the audio, which is not wanted here.
+  max_clip_duration: 30
   precision: bf16
   devices: 2
   num_nodes: 1
@@ -225,7 +241,11 @@ training:
   log_every_n_steps: 100          # yaml default
   # Phone-call augmentations: 16 kHz -> 8 kHz -> 16 kHz with varied resamplers
   augmentation:
-    enabled: true
+    # Off. With the telephony preset the model saw distorted audio on most batches
+    # (35% narrowband round-trip, 50% speed perturb), which is a lot to ask while it is
+    # also acquiring a new language -- and the overfit test that learned fast ran clean.
+    # Re-enable for a robustness pass once WER is actually descending.
+    enabled: false
     preset: telephony
     register_custom_perturbations: true
     noise_manifest: ./data/manifests/noise.json

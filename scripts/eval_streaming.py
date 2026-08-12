@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import text_norm
 from common import ensure_cuda_home, load_config, nemo_root, repo_root, run
 
 
@@ -68,7 +69,38 @@ def streaming_eval(
     print(res.stdout[-3000:], flush=True)
     if res.returncode != 0:
         raise RuntimeError(f"Streaming infer failed (rc={res.returncode})")
-    return parse_wer(res.stdout)
+    raw = parse_wer(res.stdout)
+    norm = normalized_wer_from_output(output_dir)
+    if norm is not None:
+        print(f"  raw WER {raw:.2f}%  |  punctuation-insensitive WER {norm:.2f}%", flush=True)
+    return raw, norm
+
+
+def normalized_wer_from_output(output_dir: Path) -> float | None:
+    """Re-score the infer script's own hypotheses ignoring punctuation and niqqud.
+
+    NeMo reports WER against the raw reference, where an attached comma turns a
+    correctly-heard word into an error. The script writes every (text, pred_text) pair
+    to output_path, so we can rescore from that file rather than re-running inference.
+    """
+    hyp_files = sorted(output_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not hyp_files:
+        return None
+    refs: list[str] = []
+    hyps: list[str] = []
+    with hyp_files[-1].open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if "text" in rec and "pred_text" in rec:
+                refs.append(rec["text"])
+                hyps.append(rec["pred_text"])
+    if not refs:
+        return None
+    rate, _, _ = text_norm.wer(refs, hyps, normalized=True)
+    return rate * 100.0
 
 
 def benchmark_manifests(cfg: dict, names: list[str] | None) -> list[tuple[str, Path, str]]:
@@ -178,6 +210,10 @@ def main() -> None:
         eval_items = benchmark_manifests(cfg, args.benchmark)
 
     results: dict[str, dict[str, float]] = {tag: {} for tag, _ in models}
+    # Punctuation/niqqud-insensitive scores, reported alongside raw. 20.9% of dev
+    # reference words carry punctuation, and WER charges a full word error for a missing
+    # comma -- so raw WER measures punctuation as much as recognition.
+    norm_results: dict[str, dict[str, float]] = {}
 
     for bench_name, manifest, _label in eval_items:
         for tag, model_path in models:
@@ -185,23 +221,35 @@ def main() -> None:
                 att_key = f"[{att[0]}, {att[1]}]"
                 out_dir = Path("exp") / "eval" / tag / bench_name / f"att_{att[0]}_{att[1]}"
                 try:
-                    wer = streaming_eval(infer_script, model_path, manifest, target_lang, att, out_dir)
+                    wer, norm_wer = streaming_eval(
+                        infer_script, model_path, manifest, target_lang, att, out_dir
+                    )
                 except Exception as exc:
                     print(f"FAIL [{tag}] {bench_name} att={att_key}: {exc}", flush=True)
                     continue
-                if len(att_list) == 1:
-                    results[tag][bench_name] = wer
-                else:
-                    results[tag][f"{bench_name} {att_key}"] = wer
-                print(f"[{tag}] {bench_name} att={att_key} RAW WER = {wer:.2f}%", flush=True)
+                key = bench_name if len(att_list) == 1 else f"{bench_name} {att_key}"
+                results[tag][key] = wer
+                if norm_wer is not None:
+                    norm_results.setdefault(tag, {})[key] = norm_wer
+                print(
+                    f"[{tag}] {bench_name} att={att_key} RAW WER = {wer:.2f}%"
+                    + (f", NORMALIZED = {norm_wer:.2f}%" if norm_wer is not None else ""),
+                    flush=True,
+                )
 
     headline_att = f"[{eval_cfg['att_context_size'][0]}, {eval_cfg['att_context_size'][1]}]"
     if len(att_list) == 1:
         print_results_table(results, headline_att, args.compare_base)
+        if norm_results:
+            print("\nPunctuation/niqqud-insensitive (words only):")
+            print_results_table(norm_results, headline_att, args.compare_base)
 
     out_json = Path("exp/eval/streaming_result.json")
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    out_json.write_text(
+        json.dumps({"raw": results, "normalized": norm_results}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"\nResults -> {out_json}")
 
 

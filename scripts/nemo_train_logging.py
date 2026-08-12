@@ -98,6 +98,9 @@ def apply(*, val_examples: int | None = None) -> None:
 
     wer_mod.WER.update = _patched_update  # type: ignore[method-assign]
 
+    if os.environ.get("NEMO_WER_NORMALIZE", "0") == "1":
+        patch_wer_normalize(wer_mod)
+
     from nemo.collections.asr.models import rnnt_bpe_models_prompt as prompt_mod
 
     _orig_val_pass = prompt_mod.EncDecRNNTBPEModelWithPrompt.validation_pass
@@ -111,6 +114,34 @@ def apply(*, val_examples: int | None = None) -> None:
     prompt_mod.EncDecRNNTBPEModelWithPrompt.validation_pass = _patched_val_pass  # type: ignore[method-assign]
 
     patch_lhotse_sox_quiet()
+
+
+def patch_wer_normalize(wer_mod) -> None:
+    """Score val_wer on words only, ignoring punctuation and niqqud.
+
+    WER counts a whitespace token wrong if ANY character differs, so predicting `לומר`
+    where the reference has `לומר,` is penalised exactly like the wrong word. 20.9% of
+    our dev reference words carry punctuation, and on the base model this inflated WER
+    by 8.1 points (50.55% -> 42.45%). Since val_wer drives both checkpoint selection and
+    early stopping, leaving it raw means those decisions are partly about comma
+    placement.
+
+    Patching `edit_distance` rather than `WER.update` keeps us off NeMo's internals: the
+    surrounding word count is unchanged because normalising a token never splits it
+    (only standalone punctuation tokens vanish, which are vanishingly rare). Training
+    targets are untouched -- the model still learns to emit punctuation.
+    """
+    import text_norm
+
+    _orig_edit = wer_mod.edit_distance
+
+    def _normalized_edit(r_list, h_list, *args, **kwargs):
+        r2 = [t for t in (text_norm.normalize(t) for t in r_list) if t]
+        h2 = [t for t in (text_norm.normalize(t) for t in h_list) if t]
+        return _orig_edit(r2, h2, *args, **kwargs)
+
+    wer_mod.edit_distance = _normalized_edit  # type: ignore[assignment]
+    print(">>> val_wer scored WITHOUT punctuation/niqqud (NEMO_WER_NORMALIZE=1)", flush=True)
 
 
 def patch_lhotse_sox_quiet() -> None:

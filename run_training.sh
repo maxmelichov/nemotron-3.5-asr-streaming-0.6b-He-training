@@ -9,6 +9,10 @@ export STUB_DIR=${STUB_DIR:-/root/stubs}
 export PYTHONPATH=${STUB_DIR}${PYTHONPATH:+:${PYTHONPATH}}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
+# Score val_wer on words only. 20.9% of dev reference words carry punctuation and it
+# inflated the base model's WER by 8.1 points (50.55 -> 42.45), so leaving this off means
+# checkpoint selection and early stopping are partly deciding on comma placement.
+export NEMO_WER_NORMALIZE=1
 cd "$(dirname "$0")"
 
 # NoamHoldAnnealing with an explicit 2.5e-4 peak reached at step 1000, held to step
