@@ -313,9 +313,11 @@ def _shard_attempt(repo, shard, token, args, audio_dir, kind, cols) -> tuple:
         cache_dir = audio_dir.parent / "_shard_cache"
         batches = parquet_batches_local(repo, shard, token, cols,
                                         batch_size=args.workers * 2, cache_dir=cache_dir)
+        row_index = -1
         for batch in batches:
             jobs = []
             for r in batch:
+                row_index += 1
                 if "audio" not in r:
                     note("no_audio_column")
                     continue
@@ -327,7 +329,17 @@ def _shard_attempt(repo, shard, token, args, audio_dir, kind, cols) -> tuple:
                     text = normalize_text(r["text"])
                     if not acceptable(text):
                         note("text"); continue
-                    key, speaker = str(r["segment_id"]), str(r["episode"])
+                    # segment_id is NOT unique in ivirits-audio-v2-30s: its Step-1 slug
+                    # ran re.sub(r"[^A-Za-z0-9]+", "-", episode), which erases Hebrew
+                    # titles entirely, so every episode sharing a date collapsed to the
+                    # same id. 799,054 ids covered 2,990,694 rows. Naming local wavs after
+                    # it made later segments overwrite earlier ones while both manifest
+                    # rows kept pointing at the survivor -- 36.8% of train was then
+                    # audio/text mismatched, which stalled training outright.
+                    # The parquet rows themselves are fine (audio is embedded per row), so
+                    # qualifying the key with shard + row index is enough to keep them.
+                    key = f"{r['segment_id']}_{Path(shard).stem}_{row_index}"
+                    speaker = str(r["episode"])
                 else:
                     text = normalize_text(r.get("sentence") or "")
                     if not acceptable(text):
