@@ -220,6 +220,10 @@ def main() -> None:
     # against the schedule stored in the checkpoint.
     lr = args.lr if args.lr is not None else train_cfg["lr"]
     warmup_steps = args.warmup if args.warmup is not None else train_cfg["warmup_steps"]
+    sched_name = train_cfg.get("sched_name", "NoamAnnealing")
+    hold_steps = train_cfg.get("hold_steps", 0)
+    decay_rate = train_cfg.get("decay_rate", 0.5)
+    min_lr = train_cfg.get("min_lr", 1e-6)
 
     link_dir = args.exp_dir / exp_name
     resume_ckpt: Path | None = None
@@ -317,12 +321,21 @@ def main() -> None:
         f"= {eff_per_gpu}s/GPU effective (global {eff_per_gpu * devices}s), "
         f"{batch_note}, {step_note}, {val_note}, lr={lr}"
     )
-    # NoamAnnealing: lr_t = lr * d_model^-0.5 * min(t^-0.5, t*warmup^-1.5), so `lr` is a
-    # scale factor, not the learning rate the optimizer ever sees. Print the real peak --
-    # the first run diverged (51% -> 58% WER) at a peak of 1.6e-4 that nothing surfaced.
+    # Print the real peak LR. Run 1 diverged at a peak of 1.6e-4 that nothing surfaced,
+    # because under NoamAnnealing `lr` is a d_model-scaled factor rather than the rate the
+    # optimizer ever sees. NoamHoldAnnealing states the peak explicitly instead.
     d_model = train_cfg.get("sched_d_model", 1024)
-    peak_lr = lr * d_model ** -0.5 * warmup_steps ** -0.5
-    print(f"LR schedule: NoamAnnealing warmup={warmup_steps:,} -> peak {peak_lr:.2e} at step {warmup_steps:,}")
+    if sched_name == "NoamHoldAnnealing":
+        peak_lr = lr
+        decay_start = warmup_steps + hold_steps
+        print(
+            f"LR schedule: NoamHoldAnnealing peak {peak_lr:.2e} at step {warmup_steps:,}, "
+            f"held to step {decay_start:,}, then decay_rate={decay_rate} "
+            f"(0.5 == Noam; lower decays slower), min_lr={min_lr:.1e}"
+        )
+    else:
+        peak_lr = lr * d_model ** -0.5 * warmup_steps ** -0.5
+        print(f"LR schedule: NoamAnnealing warmup={warmup_steps:,} -> peak {peak_lr:.2e} at step {warmup_steps:,}")
     print(
         "Hebrew: real fine-tune via he-IL langID prompt (slot 64 in base model) — "
         "not a trick; weights adapt to Hebrew audio+text"
@@ -394,10 +407,20 @@ def main() -> None:
         f"model.optim.lr={lr}",
         f"model.optim.weight_decay={train_cfg['weight_decay']}",
         f"model.optim.betas={_hydra_value(optim_betas)}",
-        f"model.optim.sched.name=NoamAnnealing",
+        f"model.optim.sched.name={sched_name}",
         f"model.optim.sched.warmup_steps={warmup_steps}",
-        f"model.optim.sched.d_model={sched_d_model}",
     ]
+    if sched_name == "NoamHoldAnnealing":
+        # Peak is EXPLICIT here (unlike NoamAnnealing, where lr is a d_model-scaled
+        # factor). d_model must be DELETED, not merely left unset: the streaming yaml
+        # ships sched.d_model, and WarmupHoldPolicy raises TypeError on the unexpected
+        # kwarg. Warmup -> hold at peak -> polynomial decay (0.5 == Noam; lower slower).
+        parts.append("~model.optim.sched.d_model")
+        parts.append(f"++model.optim.sched.hold_steps={hold_steps}")
+        parts.append(f"++model.optim.sched.decay_rate={decay_rate}")
+        parts.append(f"++model.optim.sched.min_lr={min_lr}")
+    else:
+        parts.append(f"model.optim.sched.d_model={sched_d_model}")
 
     # Cache-aware context. Without this the encoder keeps the checkpoint's own context
     # while eval/inference run at config's att_context_size -- train/serve mismatch.
